@@ -1,55 +1,66 @@
+from __future__ import absolute_import
 from __future__ import print_function
 from __future__ import unicode_literals
-from inspect import getdoc
-from operator import attrgetter
+
+import contextlib
+import functools
+import json
 import logging
 import re
-import signal
 import sys
+from inspect import getdoc
+from operator import attrgetter
 
-from docker.errors import APIError
-import dockerpty
-
+from . import errors
+from . import signals
 from .. import __version__
-from .. import legacy
-from ..const import DEFAULT_TIMEOUT
-from ..project import NoSuchService, ConfigurationError
-from ..service import BuildError, NeedsBuildError
+from ..config import config
+from ..config import ConfigurationError
 from ..config import parse_environment
+from ..config.environment import Environment
+from ..config.serialize import serialize_config
+from ..const import DEFAULT_TIMEOUT
+from ..const import IS_WINDOWS_PLATFORM
 from ..progress_stream import StreamOutputError
-from .command import Command
+from ..project import NoSuchService
+from ..project import OneOffFilter
+from ..project import ProjectError
+from ..service import BuildAction
+from ..service import BuildError
+from ..service import ConvergenceStrategy
+from ..service import ImageType
+from ..service import NeedsBuildError
+from .command import get_config_path_from_options
+from .command import project_from_options
+from .docopt_command import DocoptDispatcher
+from .docopt_command import get_handler
 from .docopt_command import NoSuchCommand
 from .errors import UserError
+from .formatter import ConsoleWarningFormatter
 from .formatter import Formatter
+from .log_printer import build_log_presenters
 from .log_printer import LogPrinter
-from .utils import yesno, get_version_info
+from .utils import get_version_info
+from .utils import yesno
+
+
+if not IS_WINDOWS_PLATFORM:
+    from dockerpty.pty import PseudoTerminal, RunOperation, ExecOperation
 
 log = logging.getLogger(__name__)
-
-INSECURE_SSL_WARNING = """
-Warning: --allow-insecure-ssl is deprecated and has no effect.
-It will be removed in a future version of Compose.
-"""
+console_handler = logging.StreamHandler(sys.stderr)
 
 
 def main():
-    setup_logging()
+    command = dispatch()
+
     try:
-        command = TopLevelCommand()
-        command.sys_dispatch()
-    except KeyboardInterrupt:
-        log.error("\nAborting.")
+        command()
+    except (KeyboardInterrupt, signals.ShutdownException):
+        log.error("Aborting.")
         sys.exit(1)
-    except (UserError, NoSuchService, ConfigurationError, legacy.LegacyError) as e:
+    except (UserError, NoSuchService, ConfigurationError, ProjectError) as e:
         log.error(e.msg)
-        sys.exit(1)
-    except NoSuchCommand as e:
-        log.error("No such command: %s", e.command)
-        log.error("")
-        log.error("\n".join(parse_doc_section("commands:", getdoc(e.supercommand))))
-        sys.exit(1)
-    except APIError as e:
-        log.error(e.explanation)
         sys.exit(1)
     except BuildError as e:
         log.error("Service '%s' failed to build: %s" % (e.service.name, e.reason))
@@ -60,18 +71,65 @@ def main():
     except NeedsBuildError as e:
         log.error("Service '%s' needs to be built, but --no-build was passed." % e.service.name)
         sys.exit(1)
+    except errors.ConnectionError:
+        sys.exit(1)
+
+
+def dispatch():
+    setup_logging()
+    dispatcher = DocoptDispatcher(
+        TopLevelCommand,
+        {'options_first': True, 'version': get_version_info('compose')})
+
+    try:
+        options, handler, command_options = dispatcher.parse(sys.argv[1:])
+    except NoSuchCommand as e:
+        commands = "\n".join(parse_doc_section("commands:", getdoc(e.supercommand)))
+        log.error("No such command: %s\n\n%s", e.command, commands)
+        sys.exit(1)
+
+    setup_console_handler(console_handler, options.get('--verbose'))
+    return functools.partial(perform_command, options, handler, command_options)
+
+
+def perform_command(options, handler, command_options):
+    if options['COMMAND'] in ('help', 'version'):
+        # Skip looking up the compose file.
+        handler(command_options)
+        return
+
+    if options['COMMAND'] == 'config':
+        command = TopLevelCommand(None)
+        handler(command, options, command_options)
+        return
+
+    project = project_from_options('.', options)
+    command = TopLevelCommand(project)
+    with errors.handle_connection_errors(project.client):
+        handler(command, command_options)
 
 
 def setup_logging():
-    console_handler = logging.StreamHandler(sys.stderr)
-    console_handler.setFormatter(logging.Formatter())
-    console_handler.setLevel(logging.INFO)
     root_logger = logging.getLogger()
     root_logger.addHandler(console_handler)
     root_logger.setLevel(logging.DEBUG)
 
     # Disable requests logging
     logging.getLogger("requests").propagate = False
+
+
+def setup_console_handler(handler, verbose):
+    if handler.stream.isatty():
+        format_class = ConsoleWarningFormatter
+    else:
+        format_class = logging.Formatter
+
+    if verbose:
+        handler.setFormatter(format_class('%(name)s.%(funcName)s: %(message)s'))
+        handler.setLevel(logging.DEBUG)
+    else:
+        handler.setFormatter(format_class())
+        handler.setLevel(logging.INFO)
 
 
 # stolen from docopt master
@@ -81,24 +139,40 @@ def parse_doc_section(name, source):
     return [s.strip() for s in pattern.findall(source)]
 
 
-class TopLevelCommand(Command):
+class TopLevelCommand(object):
     """Define and run multi-container applications with Docker.
 
     Usage:
-      docker-compose [options] [COMMAND] [ARGS...]
+      docker-compose [-f <arg>...] [options] [COMMAND] [ARGS...]
       docker-compose -h|--help
 
     Options:
-      -f, --file FILE           Specify an alternate compose file (default: docker-compose.yml)
-      -p, --project-name NAME   Specify an alternate project name (default: directory name)
-      --verbose                 Show more output
-      -v, --version             Print version and exit
+      -f, --file FILE             Specify an alternate compose file (default: docker-compose.yml)
+      -p, --project-name NAME     Specify an alternate project name (default: directory name)
+      --verbose                   Show more output
+      -v, --version               Print version and exit
+      -H, --host HOST             Daemon socket to connect to
+
+      --tls                       Use TLS; implied by --tlsverify
+      --tlscacert CA_PATH         Trust certs signed only by this CA
+      --tlscert CLIENT_CERT_PATH  Path to TLS certificate file
+      --tlskey TLS_KEY_PATH       Path to TLS key file
+      --tlsverify                 Use TLS and verify the remote
+      --skip-hostname-check       Don't check the daemon's hostname against the name specified
+                                  in the client certificate (for example if your docker host
+                                  is an IP address)
 
     Commands:
       build              Build or rebuild services
+      config             Validate and view the compose file
+      create             Create services
+      down               Stop and remove containers, networks, images, and volumes
+      events             Receive real time events from containers
+      exec               Execute a command in a running container
       help               Get help on a command
       kill               Kill containers
       logs               View output from containers
+      pause              Pause services
       port               Print the public port for a port binding
       ps                 List containers
       pull               Pulls service images
@@ -108,17 +182,16 @@ class TopLevelCommand(Command):
       scale              Set number of containers for a service
       start              Start services
       stop               Stop services
+      unpause            Unpause services
       up                 Create and start containers
-      migrate-to-labels  Recreate containers to add labels
       version            Show the Docker-Compose version information
-
     """
-    def docopt_options(self):
-        options = super(TopLevelCommand, self).docopt_options()
-        options['version'] = get_version_info('compose')
-        return options
 
-    def build(self, project, options):
+    def __init__(self, project, project_dir='.'):
+        self.project = project
+        self.project_dir = '.'
+
+    def build(self, options):
         """
         Build or rebuild services.
 
@@ -129,21 +202,194 @@ class TopLevelCommand(Command):
         Usage: build [options] [SERVICE...]
 
         Options:
+            --force-rm  Always remove intermediate containers.
             --no-cache  Do not use cache when building the image.
+            --pull      Always attempt to pull a newer version of the image.
         """
-        no_cache = bool(options.get('--no-cache', False))
-        project.build(service_names=options['SERVICE'], no_cache=no_cache)
+        self.project.build(
+            service_names=options['SERVICE'],
+            no_cache=bool(options.get('--no-cache', False)),
+            pull=bool(options.get('--pull', False)),
+            force_rm=bool(options.get('--force-rm', False)))
 
-    def help(self, project, options):
+    def config(self, config_options, options):
+        """
+        Validate and view the compose file.
+
+        Usage: config [options]
+
+        Options:
+            -q, --quiet     Only validate the configuration, don't print
+                            anything.
+            --services      Print the service names, one per line.
+
+        """
+        environment = Environment.from_env_file(self.project_dir)
+        config_path = get_config_path_from_options(
+            self.project_dir, config_options, environment
+        )
+        compose_config = config.load(
+            config.find(self.project_dir, config_path, environment)
+        )
+
+        if options['--quiet']:
+            return
+
+        if options['--services']:
+            print('\n'.join(service['name'] for service in compose_config.services))
+            return
+
+        print(serialize_config(compose_config))
+
+    def create(self, options):
+        """
+        Creates containers for a service.
+
+        Usage: create [options] [SERVICE...]
+
+        Options:
+            --force-recreate       Recreate containers even if their configuration and
+                                   image haven't changed. Incompatible with --no-recreate.
+            --no-recreate          If containers already exist, don't recreate them.
+                                   Incompatible with --force-recreate.
+            --no-build             Don't build an image, even if it's missing.
+            --build                Build images before creating containers.
+        """
+        service_names = options['SERVICE']
+
+        self.project.create(
+            service_names=service_names,
+            strategy=convergence_strategy_from_opts(options),
+            do_build=build_action_from_opts(options),
+        )
+
+    def down(self, options):
+        """
+        Stops containers and removes containers, networks, volumes, and images
+        created by `up`.
+
+        By default, the only things removed are:
+
+        - Containers for services defined in the Compose file
+        - Networks defined in the `networks` section of the Compose file
+        - The default network, if one is used
+
+        Networks and volumes defined as `external` are never removed.
+
+        Usage: down [options]
+
+        Options:
+            --rmi type          Remove images. Type must be one of:
+                                'all': Remove all images used by any service.
+                                'local': Remove only images that don't have a custom tag
+                                set by the `image` field.
+            -v, --volumes       Remove named volumes declared in the `volumes` section
+                                of the Compose file and anonymous volumes
+                                attached to containers.
+            --remove-orphans    Remove containers for services not defined in the
+                                Compose file
+        """
+        image_type = image_type_from_opt('--rmi', options['--rmi'])
+        self.project.down(image_type, options['--volumes'], options['--remove-orphans'])
+
+    def events(self, options):
+        """
+        Receive real time events from containers.
+
+        Usage: events [options] [SERVICE...]
+
+        Options:
+            --json      Output events as a stream of json objects
+        """
+        def format_event(event):
+            attributes = ["%s=%s" % item for item in event['attributes'].items()]
+            return ("{time} {type} {action} {id} ({attrs})").format(
+                attrs=", ".join(sorted(attributes)),
+                **event)
+
+        def json_format_event(event):
+            event['time'] = event['time'].isoformat()
+            event.pop('container')
+            return json.dumps(event)
+
+        for event in self.project.events():
+            formatter = json_format_event if options['--json'] else format_event
+            print(formatter(event))
+            sys.stdout.flush()
+
+    def exec_command(self, options):
+        """
+        Execute a command in a running container
+
+        Usage: exec [options] SERVICE COMMAND [ARGS...]
+
+        Options:
+            -d                Detached mode: Run command in the background.
+            --privileged      Give extended privileges to the process.
+            --user USER       Run the command as this user.
+            -T                Disable pseudo-tty allocation. By default `docker-compose exec`
+                              allocates a TTY.
+            --index=index     index of the container if there are multiple
+                              instances of a service [default: 1]
+        """
+        index = int(options.get('--index'))
+        service = self.project.get_service(options['SERVICE'])
+        detach = options['-d']
+
+        if IS_WINDOWS_PLATFORM and not detach:
+            raise UserError(
+                "Interactive mode is not yet supported on Windows.\n"
+                "Please pass the -d flag when using `docker-compose exec`."
+            )
+        try:
+            container = service.get_container(number=index)
+        except ValueError as e:
+            raise UserError(str(e))
+        command = [options['COMMAND']] + options['ARGS']
+        tty = not options["-T"]
+
+        create_exec_options = {
+            "privileged": options["--privileged"],
+            "user": options["--user"],
+            "tty": tty,
+            "stdin": tty,
+        }
+
+        exec_id = container.create_exec(command, **create_exec_options)
+
+        if detach:
+            container.start_exec(exec_id, tty=tty)
+            return
+
+        signals.set_signal_handler_to_shutdown()
+        try:
+            operation = ExecOperation(
+                self.project.client,
+                exec_id,
+                interactive=tty,
+            )
+            pty = PseudoTerminal(self.project.client, operation)
+            pty.start()
+        except signals.ShutdownException:
+            log.info("received shutdown exception: closing")
+        exit_code = self.project.client.exec_inspect(exec_id).get("ExitCode")
+        sys.exit(exit_code)
+
+    @classmethod
+    def help(cls, options):
         """
         Get help on a command.
 
-        Usage: help COMMAND
+        Usage: help [COMMAND]
         """
-        handler = self.get_handler(options['COMMAND'])
-        raise SystemExit(getdoc(handler))
+        if options['COMMAND']:
+            subject = get_handler(cls, options['COMMAND'])
+        else:
+            subject = cls
 
-    def kill(self, project, options):
+        print(getdoc(subject))
+
+    def kill(self, options):
         """
         Force stop service containers.
 
@@ -155,24 +401,52 @@ class TopLevelCommand(Command):
         """
         signal = options.get('-s', 'SIGKILL')
 
-        project.kill(service_names=options['SERVICE'], signal=signal)
+        self.project.kill(service_names=options['SERVICE'], signal=signal)
 
-    def logs(self, project, options):
+    def logs(self, options):
         """
         View output from containers.
 
         Usage: logs [options] [SERVICE...]
 
         Options:
-            --no-color  Produce monochrome output.
+            --no-color          Produce monochrome output.
+            -f, --follow        Follow log output.
+            -t, --timestamps    Show timestamps.
+            --tail="all"        Number of lines to show from the end of the logs
+                                for each container.
         """
-        containers = project.containers(service_names=options['SERVICE'], stopped=True)
+        containers = self.project.containers(service_names=options['SERVICE'], stopped=True)
 
-        monochrome = options['--no-color']
+        tail = options['--tail']
+        if tail is not None:
+            if tail.isdigit():
+                tail = int(tail)
+            elif tail != 'all':
+                raise UserError("tail flag must be all or a number")
+        log_args = {
+            'follow': options['--follow'],
+            'tail': tail,
+            'timestamps': options['--timestamps']
+        }
         print("Attaching to", list_containers(containers))
-        LogPrinter(containers, attach_params={'logs': True}, monochrome=monochrome).run()
+        log_printer_from_project(
+            self.project,
+            containers,
+            options['--no-color'],
+            log_args,
+            event_stream=self.project.events(service_names=options['SERVICE'])).run()
 
-    def port(self, project, options):
+    def pause(self, options):
+        """
+        Pause services.
+
+        Usage: pause [SERVICE...]
+        """
+        containers = self.project.pause(service_names=options['SERVICE'])
+        exit_if(not containers, 'No containers to pause', 1)
+
+    def port(self, options):
         """
         Print the public port for a port binding.
 
@@ -184,7 +458,7 @@ class TopLevelCommand(Command):
                               instances of a service [default: 1]
         """
         index = int(options.get('--index'))
-        service = project.get_service(options['SERVICE'])
+        service = self.project.get_service(options['SERVICE'])
         try:
             container = service.get_container(number=index)
         except ValueError as e:
@@ -193,7 +467,7 @@ class TopLevelCommand(Command):
             options['PRIVATE_PORT'],
             protocol=options.get('--protocol') or 'tcp') or '')
 
-    def ps(self, project, options):
+    def ps(self, options):
         """
         List containers.
 
@@ -203,8 +477,8 @@ class TopLevelCommand(Command):
             -q    Only display IDs
         """
         containers = sorted(
-            project.containers(service_names=options['SERVICE'], stopped=True) +
-            project.containers(service_names=options['SERVICE'], one_off=True),
+            self.project.containers(service_names=options['SERVICE'], stopped=True) +
+            self.project.containers(service_names=options['SERVICE'], one_off=OneOffFilter.only),
             key=attrgetter('name'))
 
         if options['-q']:
@@ -230,47 +504,62 @@ class TopLevelCommand(Command):
                 ])
             print(Formatter().table(headers, rows))
 
-    def pull(self, project, options):
+    def pull(self, options):
         """
         Pulls images for services.
 
         Usage: pull [options] [SERVICE...]
 
         Options:
-            --allow-insecure-ssl    Deprecated - no effect.
+            --ignore-pull-failures  Pull what it can and ignores images with pull failures.
         """
-        if options['--allow-insecure-ssl']:
-            log.warn(INSECURE_SSL_WARNING)
-
-        project.pull(
+        self.project.pull(
             service_names=options['SERVICE'],
+            ignore_pull_failures=options.get('--ignore-pull-failures')
         )
 
-    def rm(self, project, options):
+    def rm(self, options):
         """
-        Remove stopped service containers.
+        Removes stopped service containers.
+
+        By default, anonymous volumes attached to containers will not be removed. You
+        can override this with `-v`. To list all volumes, use `docker volume ls`.
+
+        Any data which is not in a volume will be lost.
 
         Usage: rm [options] [SERVICE...]
 
         Options:
             -f, --force   Don't ask to confirm removal
-            -v            Remove volumes associated with containers
+            -v            Remove any anonymous volumes attached to containers
+            -a, --all     Obsolete. Also remove one-off containers created by
+                          docker-compose run
         """
-        all_containers = project.containers(service_names=options['SERVICE'], stopped=True)
+        if options.get('--all'):
+            log.warn(
+                '--all flag is obsolete. This is now the default behavior '
+                'of `docker-compose rm`'
+            )
+        one_off = OneOffFilter.include
+
+        all_containers = self.project.containers(
+            service_names=options['SERVICE'], stopped=True, one_off=one_off
+        )
         stopped_containers = [c for c in all_containers if not c.is_running]
 
         if len(stopped_containers) > 0:
             print("Going to remove", list_containers(stopped_containers))
             if options.get('--force') \
                     or yesno("Are you sure? [yN] ", default=False):
-                project.remove_stopped(
+                self.project.remove_stopped(
                     service_names=options['SERVICE'],
-                    v=options.get('-v', False)
+                    v=options.get('-v', False),
+                    one_off=one_off
                 )
         else:
             print("No stopped containers")
 
-    def run(self, project, options):
+    def run(self, options):
         """
         Run a one-off command on a service.
 
@@ -282,95 +571,48 @@ class TopLevelCommand(Command):
         running. If you do not want to start linked services, use
         `docker-compose run --no-deps SERVICE COMMAND [ARGS...]`.
 
-        Usage: run [options] [-e KEY=VAL...] SERVICE [COMMAND] [ARGS...]
+        Usage: run [options] [-p PORT...] [-e KEY=VAL...] SERVICE [COMMAND] [ARGS...]
 
         Options:
-            --allow-insecure-ssl  Deprecated - no effect.
             -d                    Detached mode: Run container in the background, print
                                   new container name.
+            --name NAME           Assign a name to the container
             --entrypoint CMD      Override the entrypoint of the image.
             -e KEY=VAL            Set an environment variable (can be used multiple times)
             -u, --user=""         Run as specified username or uid
             --no-deps             Don't start linked services.
             --rm                  Remove container after run. Ignored in detached mode.
+            -p, --publish=[]      Publish a container's port(s) to the host
             --service-ports       Run command with the service's ports enabled and mapped
                                   to the host.
             -T                    Disable pseudo-tty allocation. By default `docker-compose run`
                                   allocates a TTY.
+            -w, --workdir=""      Working directory inside the container
         """
-        service = project.get_service(options['SERVICE'])
+        service = self.project.get_service(options['SERVICE'])
+        detach = options['-d']
 
-        if options['--allow-insecure-ssl']:
-            log.warn(INSECURE_SSL_WARNING)
+        if IS_WINDOWS_PLATFORM and not detach:
+            raise UserError(
+                "Interactive mode is not yet supported on Windows.\n"
+                "Please pass the -d flag when using `docker-compose run`."
+            )
 
-        if not options['--no-deps']:
-            deps = service.get_linked_names()
-
-            if len(deps) > 0:
-                project.up(
-                    service_names=deps,
-                    start_deps=True,
-                    allow_recreate=False,
-                )
-
-        tty = True
-        if options['-d'] or options['-T'] or not sys.stdin.isatty():
-            tty = False
+        if options['--publish'] and options['--service-ports']:
+            raise UserError(
+                'Service port mapping and manual port mapping '
+                'can not be used togather'
+            )
 
         if options['COMMAND']:
             command = [options['COMMAND']] + options['ARGS']
         else:
             command = service.options.get('command')
 
-        container_options = {
-            'command': command,
-            'tty': tty,
-            'stdin_open': not options['-d'],
-            'detach': options['-d'],
-        }
+        container_options = build_container_options(options, detach, command)
+        run_one_off_container(container_options, self.project, service, options)
 
-        if options['-e']:
-            container_options['environment'] = parse_environment(options['-e'])
-
-        if options['--entrypoint']:
-            container_options['entrypoint'] = options.get('--entrypoint')
-
-        if options['--rm']:
-            container_options['restart'] = None
-
-        if options['--user']:
-            container_options['user'] = options.get('--user')
-
-        if not options['--service-ports']:
-            container_options['ports'] = []
-
-        try:
-            container = service.create_container(
-                quiet=True,
-                one_off=True,
-                **container_options
-            )
-        except APIError as e:
-            legacy.check_for_legacy_containers(
-                project.client,
-                project.name,
-                [service.name],
-                allow_one_off=False,
-            )
-
-            raise e
-
-        if options['-d']:
-            service.start_container(container)
-            print(container.name)
-        else:
-            dockerpty.start(project.client, container.id, interactive=not options['-T'])
-            exit_code = container.wait()
-            if options['--rm']:
-                project.client.remove_container(container.id)
-            sys.exit(exit_code)
-
-    def scale(self, project, options):
+    def scale(self, options):
         """
         Set number of containers to run for a service.
 
@@ -396,17 +638,18 @@ class TopLevelCommand(Command):
             except ValueError:
                 raise UserError('Number of containers for service "%s" is not a '
                                 'number' % service_name)
-            project.get_service(service_name).scale(num, timeout=timeout)
+            self.project.get_service(service_name).scale(num, timeout=timeout)
 
-    def start(self, project, options):
+    def start(self, options):
         """
         Start existing containers.
 
         Usage: start [SERVICE...]
         """
-        project.start(service_names=options['SERVICE'])
+        containers = self.project.start(service_names=options['SERVICE'])
+        exit_if(not containers, 'No containers to start', 1)
 
-    def stop(self, project, options):
+    def stop(self, options):
         """
         Stop running containers without removing them.
 
@@ -419,9 +662,9 @@ class TopLevelCommand(Command):
                                      (default: 10)
         """
         timeout = int(options.get('--timeout') or DEFAULT_TIMEOUT)
-        project.stop(service_names=options['SERVICE'], timeout=timeout)
+        self.project.stop(service_names=options['SERVICE'], timeout=timeout)
 
-    def restart(self, project, options):
+    def restart(self, options):
         """
         Restart running containers.
 
@@ -432,9 +675,19 @@ class TopLevelCommand(Command):
                                      (default: 10)
         """
         timeout = int(options.get('--timeout') or DEFAULT_TIMEOUT)
-        project.restart(service_names=options['SERVICE'], timeout=timeout)
+        containers = self.project.restart(service_names=options['SERVICE'], timeout=timeout)
+        exit_if(not containers, 'No containers to restart', 1)
 
-    def up(self, project, options):
+    def unpause(self, options):
+        """
+        Unpause services.
+
+        Usage: unpause [SERVICE...]
+        """
+        containers = self.project.unpause(service_names=options['SERVICE'])
+        exit_if(not containers, 'No containers to unpause', 1)
+
+    def up(self, options):
         """
         Builds, (re)creates, starts, and attaches to containers for a service.
 
@@ -456,87 +709,65 @@ class TopLevelCommand(Command):
         Usage: up [options] [SERVICE...]
 
         Options:
-            --allow-insecure-ssl   Deprecated - no effect.
-            -d                     Detached mode: Run containers in the background,
-                                   print new container names.
-            --no-color             Produce monochrome output.
-            --no-deps              Don't start linked services.
-            --force-recreate       Recreate containers even if their configuration and
-                                   image haven't changed. Incompatible with --no-recreate.
-            --no-recreate          If containers already exist, don't recreate them.
-                                   Incompatible with --force-recreate.
-            --no-build             Don't build an image, even if it's missing
-            -t, --timeout TIMEOUT  Use this timeout in seconds for container shutdown
-                                   when attached or when containers are already
-                                   running. (default: 10)
+            -d                         Detached mode: Run containers in the background,
+                                       print new container names.
+                                       Incompatible with --abort-on-container-exit.
+            --no-color                 Produce monochrome output.
+            --no-deps                  Don't start linked services.
+            --force-recreate           Recreate containers even if their configuration
+                                       and image haven't changed.
+                                       Incompatible with --no-recreate.
+            --no-recreate              If containers already exist, don't recreate them.
+                                       Incompatible with --force-recreate.
+            --no-build                 Don't build an image, even if it's missing.
+            --build                    Build images before starting containers.
+            --abort-on-container-exit  Stops all containers if any container was stopped.
+                                       Incompatible with -d.
+            -t, --timeout TIMEOUT      Use this timeout in seconds for container shutdown
+                                       when attached or when containers are already
+                                       running. (default: 10)
+            --remove-orphans           Remove containers for services not
+                                       defined in the Compose file
         """
-        if options['--allow-insecure-ssl']:
-            log.warn(INSECURE_SSL_WARNING)
-
-        detached = options['-d']
-
-        monochrome = options['--no-color']
-
         start_deps = not options['--no-deps']
-        allow_recreate = not options['--no-recreate']
-        force_recreate = options['--force-recreate']
+        cascade_stop = options['--abort-on-container-exit']
         service_names = options['SERVICE']
         timeout = int(options.get('--timeout') or DEFAULT_TIMEOUT)
+        remove_orphans = options['--remove-orphans']
+        detached = options.get('-d')
 
-        if force_recreate and not allow_recreate:
-            raise UserError("--force-recreate and --no-recreate cannot be combined.")
+        if detached and cascade_stop:
+            raise UserError("--abort-on-container-exit and -d cannot be combined.")
 
-        to_attach = project.up(
-            service_names=service_names,
-            start_deps=start_deps,
-            allow_recreate=allow_recreate,
-            force_recreate=force_recreate,
-            do_build=not options['--no-build'],
-            timeout=timeout
-        )
+        with up_shutdown_context(self.project, service_names, timeout, detached):
+            to_attach = self.project.up(
+                service_names=service_names,
+                start_deps=start_deps,
+                strategy=convergence_strategy_from_opts(options),
+                do_build=build_action_from_opts(options),
+                timeout=timeout,
+                detached=detached,
+                remove_orphans=remove_orphans)
 
-        if not detached:
-            print("Attaching to", list_containers(to_attach))
-            log_printer = LogPrinter(to_attach, attach_params={"logs": True}, monochrome=monochrome)
+            if detached:
+                return
 
-            try:
-                log_printer.run()
-            finally:
-                def handler(signal, frame):
-                    project.kill(service_names=service_names)
-                    sys.exit(0)
-                signal.signal(signal.SIGINT, handler)
+            log_printer = log_printer_from_project(
+                self.project,
+                filter_containers_to_service_names(to_attach, service_names),
+                options['--no-color'],
+                {'follow': True},
+                cascade_stop,
+                event_stream=self.project.events(service_names=service_names))
+            print("Attaching to", list_containers(log_printer.containers))
+            log_printer.run()
 
-                print("Gracefully stopping... (press Ctrl+C again to force)")
-                project.stop(service_names=service_names, timeout=timeout)
+            if cascade_stop:
+                print("Aborting on container exit...")
+                self.project.stop(service_names=service_names, timeout=timeout)
 
-    def migrate_to_labels(self, project, _options):
-        """
-        Recreate containers to add labels
-
-        If you're coming from Compose 1.2 or earlier, you'll need to remove or
-        migrate your existing containers after upgrading Compose. This is
-        because, as of version 1.3, Compose uses Docker labels to keep track
-        of containers, and so they need to be recreated with labels added.
-
-        If Compose detects containers that were created without labels, it
-        will refuse to run so that you don't end up with two sets of them. If
-        you want to keep using your existing containers (for example, because
-        they have data volumes you want to preserve) you can migrate them with
-        the following command:
-
-            docker-compose migrate-to-labels
-
-        Alternatively, if you're not worried about keeping them, you can
-        remove them - Compose will just create new ones.
-
-            docker rm -f myapp_web_1 myapp_db_1 ...
-
-        Usage: migrate-to-labels
-        """
-        legacy.migrate_project_to_labels(project)
-
-    def version(self, project, options):
+    @classmethod
+    def version(cls, options):
         """
         Show version informations
 
@@ -551,5 +782,178 @@ class TopLevelCommand(Command):
             print(get_version_info('full'))
 
 
+def convergence_strategy_from_opts(options):
+    no_recreate = options['--no-recreate']
+    force_recreate = options['--force-recreate']
+    if force_recreate and no_recreate:
+        raise UserError("--force-recreate and --no-recreate cannot be combined.")
+
+    if force_recreate:
+        return ConvergenceStrategy.always
+
+    if no_recreate:
+        return ConvergenceStrategy.never
+
+    return ConvergenceStrategy.changed
+
+
+def image_type_from_opt(flag, value):
+    if not value:
+        return ImageType.none
+    try:
+        return ImageType[value]
+    except KeyError:
+        raise UserError("%s flag must be one of: all, local" % flag)
+
+
+def build_action_from_opts(options):
+    if options['--build'] and options['--no-build']:
+        raise UserError("--build and --no-build can not be combined.")
+
+    if options['--build']:
+        return BuildAction.force
+
+    if options['--no-build']:
+        return BuildAction.skip
+
+    return BuildAction.none
+
+
+def build_container_options(options, detach, command):
+    container_options = {
+        'command': command,
+        'tty': not (detach or options['-T'] or not sys.stdin.isatty()),
+        'stdin_open': not detach,
+        'detach': detach,
+    }
+
+    if options['-e']:
+        container_options['environment'] = parse_environment(options['-e'])
+
+    if options['--entrypoint']:
+        container_options['entrypoint'] = options.get('--entrypoint')
+
+    if options['--rm']:
+        container_options['restart'] = None
+
+    if options['--user']:
+        container_options['user'] = options.get('--user')
+
+    if not options['--service-ports']:
+        container_options['ports'] = []
+
+    if options['--publish']:
+        container_options['ports'] = options.get('--publish')
+
+    if options['--name']:
+        container_options['name'] = options['--name']
+
+    if options['--workdir']:
+        container_options['working_dir'] = options['--workdir']
+
+    return container_options
+
+
+def run_one_off_container(container_options, project, service, options):
+    if not options['--no-deps']:
+        deps = service.get_dependency_names()
+        if deps:
+            project.up(
+                service_names=deps,
+                start_deps=True,
+                strategy=ConvergenceStrategy.never)
+
+    project.initialize()
+
+    container = service.create_container(
+        quiet=True,
+        one_off=True,
+        **container_options)
+
+    if options['-d']:
+        service.start_container(container)
+        print(container.name)
+        return
+
+    def remove_container(force=False):
+        if options['--rm']:
+            project.client.remove_container(container.id, force=True)
+
+    signals.set_signal_handler_to_shutdown()
+    try:
+        try:
+            operation = RunOperation(
+                project.client,
+                container.id,
+                interactive=not options['-T'],
+                logs=False,
+            )
+            pty = PseudoTerminal(project.client, operation)
+            sockets = pty.sockets()
+            service.start_container(container)
+            pty.start(sockets)
+            exit_code = container.wait()
+        except signals.ShutdownException:
+            project.client.stop(container.id)
+            exit_code = 1
+    except signals.ShutdownException:
+        project.client.kill(container.id)
+        remove_container(force=True)
+        sys.exit(2)
+
+    remove_container()
+    sys.exit(exit_code)
+
+
+def log_printer_from_project(
+    project,
+    containers,
+    monochrome,
+    log_args,
+    cascade_stop=False,
+    event_stream=None,
+):
+    return LogPrinter(
+        containers,
+        build_log_presenters(project.service_names, monochrome),
+        event_stream or project.events(),
+        cascade_stop=cascade_stop,
+        log_args=log_args)
+
+
+def filter_containers_to_service_names(containers, service_names):
+    if not service_names:
+        return containers
+
+    return [
+        container
+        for container in containers if container.service in service_names
+    ]
+
+
+@contextlib.contextmanager
+def up_shutdown_context(project, service_names, timeout, detached):
+    if detached:
+        yield
+        return
+
+    signals.set_signal_handler_to_shutdown()
+    try:
+        try:
+            yield
+        except signals.ShutdownException:
+            print("Gracefully stopping... (press Ctrl+C again to force)")
+            project.stop(service_names=service_names, timeout=timeout)
+    except signals.ShutdownException:
+        project.kill(service_names=service_names)
+        sys.exit(2)
+
+
 def list_containers(containers):
     return ", ".join(c.name for c in containers)
+
+
+def exit_if(condition, message, exit_code):
+    if condition:
+        log.error(message)
+        raise SystemExit(exit_code)

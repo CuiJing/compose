@@ -1,6 +1,7 @@
-import json
-import os
-import codecs
+from __future__ import absolute_import
+from __future__ import unicode_literals
+
+from compose import utils
 
 
 class StreamOutputError(Exception):
@@ -8,35 +9,42 @@ class StreamOutputError(Exception):
 
 
 def stream_output(output, stream):
-    is_terminal = hasattr(stream, 'fileno') and os.isatty(stream.fileno())
-    stream = codecs.getwriter('utf-8')(stream)
+    is_terminal = hasattr(stream, 'isatty') and stream.isatty()
+    stream = utils.get_output_stream(stream)
     all_events = []
     lines = {}
     diff = 0
 
-    for chunk in output:
-        event = json.loads(chunk)
+    for event in utils.json_stream(output):
         all_events.append(event)
+        is_progress_event = 'progress' in event or 'progressDetail' in event
 
-        if 'progress' in event or 'progressDetail' in event:
-            image_id = event.get('id')
-            if not image_id:
-                continue
+        if not is_progress_event:
+            print_output_event(event, stream, is_terminal)
+            stream.flush()
+            continue
 
-            if image_id in lines:
-                diff = len(lines) - lines[image_id]
-            else:
-                lines[image_id] = len(lines)
-                stream.write("\n")
-                diff = 0
+        if not is_terminal:
+            continue
 
-            if is_terminal:
-                # move cursor up `diff` rows
-                stream.write("%c[%dA" % (27, diff))
+        # if it's a progress event and we have a terminal, then display the progress bars
+        image_id = event.get('id')
+        if not image_id:
+            continue
+
+        if image_id in lines:
+            diff = len(lines) - lines[image_id]
+        else:
+            lines[image_id] = len(lines)
+            stream.write("\n")
+            diff = 0
+
+        # move cursor up `diff` rows
+        stream.write("%c[%dA" % (27, diff))
 
         print_output_event(event, stream, is_terminal)
 
-        if 'id' in event and is_terminal:
+        if 'id' in event:
             # move cursor back down
             stream.write("%c[%dB" % (27, diff))
 
@@ -55,7 +63,6 @@ def print_output_event(event, stream, is_terminal):
         # erase current line
         stream.write("%c[2K\r" % 27)
         terminator = "\r"
-        pass
     elif 'progressDetail' in event:
         return
 

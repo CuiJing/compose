@@ -1,8 +1,10 @@
+from __future__ import absolute_import
+from __future__ import unicode_literals
 
 import functools
-from itertools import chain
 import logging
 import pprint
+from itertools import chain
 
 import six
 

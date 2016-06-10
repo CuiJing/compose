@@ -1,102 +1,99 @@
-from __future__ import unicode_literals
 from __future__ import absolute_import
-from requests.exceptions import ConnectionError, SSLError
+from __future__ import unicode_literals
+
 import logging
 import os
 import re
+
 import six
 
-from .. import config
-from ..project import Project
-from ..service import ConfigError
-from .docopt_command import DocoptCommand
-from .utils import call_silently, is_mac, is_ubuntu
-from .docker_client import docker_client
 from . import verbose_proxy
-from . import errors
-from .. import __version__
+from .. import config
+from ..config.environment import Environment
+from ..const import API_VERSIONS
+from ..project import Project
+from .docker_client import docker_client
+from .docker_client import tls_config_from_options
+from .utils import get_version_info
 
 log = logging.getLogger(__name__)
 
 
-class Command(DocoptCommand):
-    base_dir = '.'
+def project_from_options(project_dir, options):
+    environment = Environment.from_env_file(project_dir)
+    host = options.get('--host')
+    if host is not None:
+        host = host.lstrip('=')
+    return get_project(
+        project_dir,
+        get_config_path_from_options(project_dir, options, environment),
+        project_name=options.get('--project-name'),
+        verbose=options.get('--verbose'),
+        host=host,
+        tls_config=tls_config_from_options(options),
+        environment=environment
+    )
 
-    def dispatch(self, *args, **kwargs):
-        try:
-            super(Command, self).dispatch(*args, **kwargs)
-        except SSLError as e:
-            raise errors.UserError('SSL error: %s' % e)
-        except ConnectionError:
-            if call_silently(['which', 'docker']) != 0:
-                if is_mac():
-                    raise errors.DockerNotFoundMac()
-                elif is_ubuntu():
-                    raise errors.DockerNotFoundUbuntu()
-                else:
-                    raise errors.DockerNotFoundGeneric()
-            elif call_silently(['which', 'boot2docker']) == 0:
-                raise errors.ConnectionErrorBoot2Docker()
-            else:
-                raise errors.ConnectionErrorGeneric(self.get_client().base_url)
 
-    def perform_command(self, options, handler, command_options):
-        if options['COMMAND'] in ('help', 'version'):
-            # Skip looking up the compose file.
-            handler(None, command_options)
-            return
+def get_config_path_from_options(base_dir, options, environment):
+    file_option = options.get('--file')
+    if file_option:
+        return file_option
 
-        if 'FIG_FILE' in os.environ:
-            log.warn('The FIG_FILE environment variable is deprecated.')
-            log.warn('Please use COMPOSE_FILE instead.')
+    config_files = environment.get('COMPOSE_FILE')
+    if config_files:
+        return config_files.split(os.pathsep)
+    return None
 
-        explicit_config_path = options.get('--file') or os.environ.get('COMPOSE_FILE') or os.environ.get('FIG_FILE')
-        project = self.get_project(
-            explicit_config_path,
-            project_name=options.get('--project-name'),
-            verbose=options.get('--verbose'))
 
-        handler(project, command_options)
+def get_client(environment, verbose=False, version=None, tls_config=None, host=None):
+    client = docker_client(
+        version=version, tls_config=tls_config, host=host,
+        environment=environment
+    )
+    if verbose:
+        version_info = six.iteritems(client.version())
+        log.info(get_version_info('full'))
+        log.info("Docker base_url: %s", client.base_url)
+        log.info("Docker version: %s",
+                 ", ".join("%s=%s" % item for item in version_info))
+        return verbose_proxy.VerboseProxy('docker', client)
+    return client
 
-    def get_client(self, verbose=False):
-        client = docker_client()
-        if verbose:
-            version_info = six.iteritems(client.version())
-            log.info("Compose version %s", __version__)
-            log.info("Docker base_url: %s", client.base_url)
-            log.info("Docker version: %s",
-                     ", ".join("%s=%s" % item for item in version_info))
-            return verbose_proxy.VerboseProxy('docker', client)
-        return client
 
-    def get_project(self, config_path=None, project_name=None, verbose=False):
-        config_details = config.find(self.base_dir, config_path)
+def get_project(project_dir, config_path=None, project_name=None, verbose=False,
+                host=None, tls_config=None, environment=None):
+    if not environment:
+        environment = Environment.from_env_file(project_dir)
+    config_details = config.find(project_dir, config_path, environment)
+    project_name = get_project_name(
+        config_details.working_dir, project_name, environment
+    )
+    config_data = config.load(config_details)
 
-        try:
-            return Project.from_dicts(
-                self.get_project_name(config_details.working_dir, project_name),
-                config.load(config_details),
-                self.get_client(verbose=verbose))
-        except ConfigError as e:
-            raise errors.UserError(six.text_type(e))
+    api_version = environment.get(
+        'COMPOSE_API_VERSION',
+        API_VERSIONS[config_data.version])
+    client = get_client(
+        verbose=verbose, version=api_version, tls_config=tls_config,
+        host=host, environment=environment
+    )
 
-    def get_project_name(self, working_dir, project_name=None):
-        def normalize_name(name):
-            return re.sub(r'[^a-z0-9]', '', name.lower())
+    return Project.from_config(project_name, config_data, client)
 
-        if 'FIG_PROJECT_NAME' in os.environ:
-            log.warn('The FIG_PROJECT_NAME environment variable is deprecated.')
-            log.warn('Please use COMPOSE_PROJECT_NAME instead.')
 
-        project_name = (
-            project_name or
-            os.environ.get('COMPOSE_PROJECT_NAME') or
-            os.environ.get('FIG_PROJECT_NAME'))
-        if project_name is not None:
-            return normalize_name(project_name)
+def get_project_name(working_dir, project_name=None, environment=None):
+    def normalize_name(name):
+        return re.sub(r'[^a-z0-9]', '', name.lower())
 
-        project = os.path.basename(os.path.abspath(working_dir))
-        if project:
-            return normalize_name(project)
+    if not environment:
+        environment = Environment.from_env_file(working_dir)
+    project_name = project_name or environment.get('COMPOSE_PROJECT_NAME')
+    if project_name:
+        return normalize_name(project_name)
 
-        return 'default'
+    project = os.path.basename(os.path.abspath(working_dir))
+    if project:
+        return normalize_name(project)
+
+    return 'default'

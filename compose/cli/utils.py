@@ -1,14 +1,23 @@
-from __future__ import unicode_literals
 from __future__ import absolute_import
 from __future__ import division
+from __future__ import unicode_literals
 
-from .. import __version__
-import datetime
-from docker import version as docker_py_version
 import os
 import platform
-import subprocess
 import ssl
+import subprocess
+import sys
+
+import docker
+
+import compose
+
+# WindowsError is not defined on non-win32 platforms. Avoid runtime errors by
+# defining it as OSError (its parent class) if missing.
+try:
+    WindowsError
+except NameError:
+    WindowsError = OSError
 
 
 def yesno(prompt, default=None):
@@ -21,7 +30,7 @@ def yesno(prompt, default=None):
     Unrecognised input (anything other than "y", "n", "yes",
     "no" or "") will return None.
     """
-    answer = raw_input(prompt).strip().lower()
+    answer = input(prompt).strip().lower()
 
     if answer == "y" or answer == "yes":
         return True
@@ -33,81 +42,14 @@ def yesno(prompt, default=None):
         return None
 
 
-# http://stackoverflow.com/a/5164027
-def prettydate(d):
-    diff = datetime.datetime.utcnow() - d
-    s = diff.seconds
-    if diff.days > 7 or diff.days < 0:
-        return d.strftime('%d %b %y')
-    elif diff.days == 1:
-        return '1 day ago'
-    elif diff.days > 1:
-        return '{0} days ago'.format(diff.days)
-    elif s <= 1:
-        return 'just now'
-    elif s < 60:
-        return '{0} seconds ago'.format(s)
-    elif s < 120:
-        return '1 minute ago'
-    elif s < 3600:
-        return '{0} minutes ago'.format(s / 60)
-    elif s < 7200:
-        return '1 hour ago'
-    else:
-        return '{0} hours ago'.format(s / 3600)
-
-
-def mkdir(path, permissions=0o700):
-    if not os.path.exists(path):
-        os.mkdir(path)
-
-    os.chmod(path, permissions)
-
-    return path
-
-
-def find_candidates_in_parent_dirs(filenames, path):
+def input(prompt):
     """
-    Given a directory path to start, looks for filenames in the
-    directory, and then each parent directory successively,
-    until found.
-
-    Returns tuple (candidates, path).
+    Version of input (raw_input in Python 2) which forces a flush of sys.stdout
+    to avoid problems where the prompt fails to appear due to line buffering
     """
-    candidates = [filename for filename in filenames
-                  if os.path.exists(os.path.join(path, filename))]
-
-    if len(candidates) == 0:
-        parent_dir = os.path.join(path, '..')
-        if os.path.abspath(parent_dir) != os.path.abspath(path):
-            return find_candidates_in_parent_dirs(filenames, parent_dir)
-
-    return (candidates, path)
-
-
-def split_buffer(reader, separator):
-    """
-    Given a generator which yields strings and a separator string,
-    joins all input, splits on the separator and yields each chunk.
-
-    Unlike string.split(), each chunk includes the trailing
-    separator, except for the last one if none was found on the end
-    of the input.
-    """
-    buffered = str('')
-    separator = str(separator)
-
-    for data in reader:
-        buffered += data
-        while True:
-            index = buffered.find(separator)
-            if index == -1:
-                break
-            yield buffered[:index + 1]
-            buffered = buffered[index + 1:]
-
-    if len(buffered) > 0:
-        yield buffered
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    return sys.stdin.readline().rstrip(b'\n')
 
 
 def call_silently(*args, **kwargs):
@@ -115,7 +57,12 @@ def call_silently(*args, **kwargs):
     Like subprocess.call(), but redirects stdout and stderr to /dev/null.
     """
     with open(os.devnull, 'w') as shutup:
-        return subprocess.call(*args, stdout=shutup, stderr=shutup, **kwargs)
+        try:
+            return subprocess.call(*args, stdout=shutup, stderr=shutup, **kwargs)
+        except WindowsError:
+            # On Windows, subprocess.call() can still raise exceptions. Normalize
+            # to POSIXy behaviour by returning a nonzero exit code.
+            return 1
 
 
 def is_mac():
@@ -127,13 +74,32 @@ def is_ubuntu():
 
 
 def get_version_info(scope):
-    versioninfo = 'docker-compose version: %s' % __version__
+    versioninfo = 'docker-compose version {}, build {}'.format(
+        compose.__version__,
+        get_build_version())
+
     if scope == 'compose':
         return versioninfo
-    elif scope == 'full':
-        return versioninfo + '\n' \
-            + "docker-py version: %s\n" % docker_py_version \
-            + "%s version: %s\n" % (platform.python_implementation(), platform.python_version()) \
-            + "OpenSSL version: %s" % ssl.OPENSSL_VERSION
-    else:
-        raise RuntimeError('passed unallowed value to `cli.utils.get_version_info`')
+    if scope == 'full':
+        return (
+            "{}\n"
+            "docker-py version: {}\n"
+            "{} version: {}\n"
+            "OpenSSL version: {}"
+        ).format(
+            versioninfo,
+            docker.version,
+            platform.python_implementation(),
+            platform.python_version(),
+            ssl.OPENSSL_VERSION)
+
+    raise ValueError("{} is not a valid version scope".format(scope))
+
+
+def get_build_version():
+    filename = os.path.join(os.path.dirname(compose.__file__), 'GITSHA')
+    if not os.path.exists(filename):
+        return 'unknown'
+
+    with open(filename) as fh:
+        return fh.read().strip()

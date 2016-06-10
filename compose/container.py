@@ -1,10 +1,13 @@
-from __future__ import unicode_literals
 from __future__ import absolute_import
+from __future__ import unicode_literals
 
-import six
 from functools import reduce
 
-from .const import LABEL_CONTAINER_NUMBER, LABEL_SERVICE
+import six
+
+from .const import LABEL_CONTAINER_NUMBER
+from .const import LABEL_PROJECT
+from .const import LABEL_SERVICE
 
 
 class Container(object):
@@ -16,22 +19,27 @@ class Container(object):
         self.client = client
         self.dictionary = dictionary
         self.has_been_inspected = has_been_inspected
+        self.log_stream = None
 
     @classmethod
     def from_ps(cls, client, dictionary, **kwargs):
         """
         Construct a container object from the output of GET /containers/json.
         """
+        name = get_container_name(dictionary)
+        if name is None:
+            return None
+
         new_dictionary = {
             'Id': dictionary['Id'],
             'Image': dictionary['Image'],
-            'Name': '/' + get_container_name(dictionary),
+            'Name': '/' + name,
         }
         return cls(client, new_dictionary, **kwargs)
 
     @classmethod
     def from_id(cls, client, id):
-        return cls(client, client.inspect_container(id))
+        return cls(client, client.inspect_container(id), has_been_inspected=True)
 
     @classmethod
     def create(cls, client, **options):
@@ -52,15 +60,24 @@ class Container(object):
 
     @property
     def short_id(self):
-        return self.id[:10]
+        return self.id[:12]
 
     @property
     def name(self):
         return self.dictionary['Name'][1:]
 
     @property
+    def service(self):
+        return self.labels.get(LABEL_SERVICE)
+
+    @property
     def name_without_project(self):
-        return '{0}_{1}'.format(self.labels.get(LABEL_SERVICE), self.number)
+        project = self.labels.get(LABEL_PROJECT)
+
+        if self.name.startswith('{0}_{1}'.format(project, self.service)):
+            return '{0}_{1}'.format(self.service, self.number)
+        else:
+            return self.name
 
     @property
     def number(self):
@@ -91,11 +108,19 @@ class Container(object):
         return self.get('Config.Labels') or {}
 
     @property
+    def stop_signal(self):
+        return self.get('Config.StopSignal')
+
+    @property
     def log_config(self):
         return self.get('HostConfig.LogConfig') or None
 
     @property
     def human_readable_state(self):
+        if self.is_paused:
+            return 'Paused'
+        if self.is_restarting:
+            return 'Restarting'
         if self.is_running:
             return 'Ghost' if self.get('State.Ghost') else 'Up'
         else:
@@ -109,11 +134,43 @@ class Container(object):
 
     @property
     def environment(self):
-        return dict(var.split("=", 1) for var in self.get('Config.Env') or [])
+        def parse_env(var):
+            if '=' in var:
+                return var.split("=", 1)
+            return var, None
+        return dict(parse_env(var) for var in self.get('Config.Env') or [])
+
+    @property
+    def exit_code(self):
+        return self.get('State.ExitCode')
 
     @property
     def is_running(self):
         return self.get('State.Running')
+
+    @property
+    def is_restarting(self):
+        return self.get('State.Restarting')
+
+    @property
+    def is_paused(self):
+        return self.get('State.Paused')
+
+    @property
+    def log_driver(self):
+        return self.get('HostConfig.LogConfig.Type')
+
+    @property
+    def has_api_logs(self):
+        log_type = self.log_driver
+        return not log_type or log_type != 'none'
+
+    def attach_log_stream(self):
+        """A log stream can only be attached if the container uses a json-file
+        log driver.
+        """
+        if self.has_api_logs:
+            self.log_stream = self.attach(stdout=True, stderr=True, stream=True)
 
     def get(self, key):
         """Return a value from the container or None if the value is not set.
@@ -132,11 +189,23 @@ class Container(object):
         port = self.ports.get("%s/%s" % (port, protocol))
         return "{HostIp}:{HostPort}".format(**port[0]) if port else None
 
+    def get_mount(self, mount_dest):
+        for mount in self.get('Mounts'):
+            if mount['Destination'] == mount_dest:
+                return mount
+        return None
+
     def start(self, **options):
         return self.client.start(self.id, **options)
 
     def stop(self, **options):
         return self.client.stop(self.id, **options)
+
+    def pause(self, **options):
+        return self.client.pause(self.id, **options)
+
+    def unpause(self, **options):
+        return self.client.unpause(self.id, **options)
 
     def kill(self, **options):
         return self.client.kill(self.id, **options)
@@ -146,6 +215,21 @@ class Container(object):
 
     def remove(self, **options):
         return self.client.remove_container(self.id, **options)
+
+    def create_exec(self, command, **options):
+        return self.client.exec_create(self.id, command, **options)
+
+    def start_exec(self, exec_id, **options):
+        return self.client.exec_start(exec_id, **options)
+
+    def rename_to_tmp_name(self):
+        """Rename the container to a hopefully unique temporary container name
+        by prepending the short id.
+        """
+        self.client.rename(
+            self.id,
+            '%s_%s' % (self.short_id, self.name)
+        )
 
     def inspect_if_not_inspected(self):
         if not self.has_been_inspected:
@@ -162,21 +246,8 @@ class Container(object):
         self.has_been_inspected = True
         return self.dictionary
 
-    # TODO: only used by tests, move to test module
-    def links(self):
-        links = []
-        for container in self.client.containers():
-            for name in container['Names']:
-                bits = name.split('/')
-                if len(bits) > 2 and bits[1] == self.name:
-                    links.append(bits[2])
-        return links
-
     def attach(self, *args, **kwargs):
         return self.client.attach(self.id, *args, **kwargs)
-
-    def attach_socket(self, **kwargs):
-        return self.client.attach_socket(self.id, **kwargs)
 
     def __repr__(self):
         return '<Container: %s (%s)>' % (self.name, self.id[:6])

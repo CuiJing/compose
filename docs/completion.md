@@ -1,15 +1,15 @@
 <!--[metadata]>
 +++
-title = "Command Completion"
+title = "Command-line Completion"
 description = "Compose CLI reference"
 keywords = ["fig, composition, compose, docker, orchestration, cli,  reference"]
 [menu.main]
-parent="smn_workw_compose"
-weight=3
+parent="workw_compose"
+weight=88
 +++
 <![end-metadata]-->
 
-# Command Completion
+# Command-line Completion
 
 Compose comes with [command completion](http://en.wikipedia.org/wiki/Command-line_completion)
 for the bash and zsh shell.
@@ -23,7 +23,7 @@ On a Mac, install with `brew install bash-completion`
 
 Place the completion script in `/etc/bash_completion.d/` (`/usr/local/etc/bash_completion.d/` on a Mac), using e.g.
 
-     curl -L https://raw.githubusercontent.com/docker/compose/$(docker-compose --version | awk 'NR==1{print $NF}')/contrib/completion/bash/docker-compose > /etc/bash_completion.d/docker-compose
+     curl -L https://raw.githubusercontent.com/docker/compose/$(docker-compose version --short)/contrib/completion/bash/docker-compose > /etc/bash_completion.d/docker-compose
 
 Completion will be available upon next login.
 
@@ -32,7 +32,7 @@ Completion will be available upon next login.
 Place the completion script in your `/path/to/zsh/completion`, using e.g. `~/.zsh/completion/`
 
     mkdir -p ~/.zsh/completion
-    curl -L https://raw.githubusercontent.com/docker/compose/$(docker-compose --version | awk 'NR==1{print $NF}')/contrib/completion/zsh/_docker-compose > ~/.zsh/completion/_docker-compose
+    curl -L https://raw.githubusercontent.com/docker/compose/$(docker-compose version --short)/contrib/completion/zsh/_docker-compose > ~/.zsh/completion/_docker-compose
 
 Include the directory in your `$fpath`, e.g. by adding in `~/.zshrc`
 
@@ -59,11 +59,10 @@ Enjoy working with Compose faster and with less typos!
 
 ## Compose documentation
 
-- [User guide](/)
+- [User guide](index.md)
 - [Installing Compose](install.md)
 - [Get started with Django](django.md)
 - [Get started with Rails](rails.md)
-- [Get started with Wordpress](wordpress.md)
-- [Command line reference](cli.md)
-- [Yaml file reference](yml.md)
-- [Compose environment variables](env.md)
+- [Get started with WordPress](wordpress.md)
+- [Command line reference](./reference/index.md)
+- [Compose file reference](compose-file.md)

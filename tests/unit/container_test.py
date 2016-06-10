@@ -1,9 +1,10 @@
+from __future__ import absolute_import
 from __future__ import unicode_literals
-from .. import unittest
 
-import mock
 import docker
 
+from .. import mock
+from .. import unittest
 from compose.container import Container
 from compose.container import get_container_name
 
@@ -11,8 +12,9 @@ from compose.container import get_container_name
 class ContainerTest(unittest.TestCase):
 
     def setUp(self):
+        self.container_id = "abcabcabcbabc12345"
         self.container_dict = {
-            "Id": "abc",
+            "Id": self.container_id,
             "Image": "busybox:latest",
             "Command": "top",
             "Created": 1387384730,
@@ -40,19 +42,22 @@ class ContainerTest(unittest.TestCase):
         self.assertEqual(
             container.dictionary,
             {
-                "Id": "abc",
+                "Id": self.container_id,
                 "Image": "busybox:latest",
                 "Name": "/composetest_db_1",
             })
 
     def test_from_ps_prefixed(self):
-        self.container_dict['Names'] = ['/swarm-host-1' + n for n in self.container_dict['Names']]
+        self.container_dict['Names'] = [
+            '/swarm-host-1' + n for n in self.container_dict['Names']
+        ]
 
-        container = Container.from_ps(None,
-                                      self.container_dict,
-                                      has_been_inspected=True)
+        container = Container.from_ps(
+            None,
+            self.container_dict,
+            has_been_inspected=True)
         self.assertEqual(container.dictionary, {
-            "Id": "abc",
+            "Id": self.container_id,
             "Image": "busybox:latest",
             "Name": "/composetest_db_1",
         })
@@ -83,8 +88,14 @@ class ContainerTest(unittest.TestCase):
         self.assertEqual(container.name, "composetest_db_1")
 
     def test_name_without_project(self):
+        self.container_dict['Name'] = "/composetest_web_7"
         container = Container(None, self.container_dict, has_been_inspected=True)
         self.assertEqual(container.name_without_project, "web_7")
+
+    def test_name_without_project_custom_container_name(self):
+        self.container_dict['Name'] = "/custom_name_of_container"
+        container = Container(None, self.container_dict, has_been_inspected=True)
+        self.assertEqual(container.name_without_project, "custom_name_of_container")
 
     def test_inspect_if_not_inspected(self):
         mock_client = mock.create_autospec(docker.Client)
@@ -135,11 +146,25 @@ class ContainerTest(unittest.TestCase):
         self.assertEqual(container.get('HostConfig.VolumesFrom'), ["volume_id"])
         self.assertEqual(container.get('Foo.Bar.DoesNotExist'), None)
 
+    def test_short_id(self):
+        container = Container(None, self.container_dict, has_been_inspected=True)
+        assert container.short_id == self.container_id[:12]
+
 
 class GetContainerNameTestCase(unittest.TestCase):
 
     def test_get_container_name(self):
         self.assertIsNone(get_container_name({}))
         self.assertEqual(get_container_name({'Name': 'myproject_db_1'}), 'myproject_db_1')
-        self.assertEqual(get_container_name({'Names': ['/myproject_db_1', '/myproject_web_1/db']}), 'myproject_db_1')
-        self.assertEqual(get_container_name({'Names': ['/swarm-host-1/myproject_db_1', '/swarm-host-1/myproject_web_1/db']}), 'myproject_db_1')
+        self.assertEqual(
+            get_container_name({'Names': ['/myproject_db_1', '/myproject_web_1/db']}),
+            'myproject_db_1')
+        self.assertEqual(
+            get_container_name({
+                'Names': [
+                    '/swarm-host-1/myproject_db_1',
+                    '/swarm-host-1/myproject_web_1/db'
+                ]
+            }),
+            'myproject_db_1'
+        )

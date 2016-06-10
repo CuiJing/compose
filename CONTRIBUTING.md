@@ -30,34 +30,45 @@ that should get you started.
    `docker-compose` from anywhere on your machine, it will run your development
    version of Compose.
 
+## Install pre-commit hooks
+
+This step is optional, but recommended. Pre-commit hooks will run style checks
+and in some cases fix style issues for you, when you commit code.
+
+Install the git pre-commit hooks using [tox](https://tox.readthedocs.org) by
+running `tox -e pre-commit` or by following the
+[pre-commit install guide](http://pre-commit.com/#install).
+
+To run the style checks at any time run `tox -e pre-commit`.
+
 ## Submitting a pull request
 
-See Docker's [basic contribution workflow](https://docs.docker.com/project/make-a-contribution/#the-basic-contribution-workflow) for a guide on how to submit a pull request for code or documentation.
+See Docker's [basic contribution workflow](https://docs.docker.com/opensource/workflow/make-a-contribution/#the-basic-contribution-workflow) for a guide on how to submit a pull request for code or documentation.
 
 ## Running the test suite
 
 Use the test script to run linting checks and then the full test suite against
 different Python interpreters:
 
-    $ script/test
+    $ script/test/default
 
 Tests are run against a Docker daemon inside a container, so that we can test
 against multiple Docker versions. By default they'll run against only the latest
 Docker version - set the `DOCKER_VERSIONS` environment variable to "all" to run
 against all supported versions:
 
-    $ DOCKER_VERSIONS=all script/test
+    $ DOCKER_VERSIONS=all script/test/default
 
-Arguments to `script/test` are passed through to the `nosetests` executable, so
+Arguments to `script/test/default` are passed through to the `tox` executable, so
 you can specify a test directory, file, module, class or method:
 
-    $ script/test tests/unit
-    $ script/test tests/unit/cli_test.py
-    $ script/test tests.integration.service_test
-    $ script/test tests.integration.service_test:ServiceTest.test_containers
+    $ script/test/default tests/unit
+    $ script/test/default tests/unit/cli_test.py
+    $ script/test/default tests/unit/config_test.py::ConfigTest
+    $ script/test/default tests/unit/config_test.py::ConfigTest::test_load
 
 ## Finding things to work on
 
-We use a [Waffle.io board](https://waffle.io/docker/compose) to keep track of specific things we are working on and planning to work on. If you're looking for things to work on, stuff in the backlog is a great place to start.
+We use a [ZenHub board](https://www.zenhub.io/) to keep track of specific things we are working on and planning to work on. If you're looking for things to work on, stuff in the backlog is a great place to start.
 
 For more information about our project planning, take a look at our [GitHub wiki](https://github.com/docker/compose/wiki).

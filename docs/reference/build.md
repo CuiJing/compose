@@ -15,7 +15,9 @@ parent = "smn_compose_cli"
 Usage: build [options] [SERVICE...]
 
 Options:
+--force-rm  Always remove intermediate containers.
 --no-cache  Do not use cache when building the image.
+--pull      Always attempt to pull a newer version of the image.
 ```
 
 Services are built once and then tagged as `project_service`, e.g.,
